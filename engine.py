@@ -46,7 +46,7 @@ class SheetsClient:
         raise ValueError("Unknown table: " + table_key)
 
     def _get_headers(self, sheet_id: str, tab_name: str) -> dict:
-        """Возвращает {col_name: col_idx}, кешируется."""
+        """Возвращает {normalized_name: col_idx}, кешируется."""
         key = (sheet_id, tab_name)
         if key in HEADER_CACHE:
             return HEADER_CACHE[key]
@@ -57,7 +57,16 @@ class SheetsClient:
         hdrs = {}
         if rows:
             for i, h in enumerate(rows[0]):
-                hdrs[str(h).strip()] = i
+                raw = str(h).strip()
+                # Normalize: remove trailing numbers, collapse whitespace/newlines
+                import re
+                norm = re.sub(r'\s*\d+\s*$', '', raw)  # strip trailing number
+                norm = re.sub(r'\s+', ' ', norm).strip()  # collapse spaces/newlines
+                if norm:
+                    # Always store by normalized name, allowing overwrite by explicit match
+                    current = hdrs.get(norm)
+                    if current is None or len(raw) > len(str(rows[0][current]).strip()):
+                        hdrs[norm] = i
         HEADER_CACHE[key] = hdrs
         return hdrs
 
