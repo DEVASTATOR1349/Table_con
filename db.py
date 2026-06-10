@@ -87,8 +87,8 @@ def log_sync(step_id: int, action: str, source: str, target: str, sheet_row: int
         c = _conn()
         cur = c.cursor()
         cur.execute(
-            "INSERT INTO sync_log (step_id, action, source_table, target_table, sheet_row, details, status) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-            (step_id, action, source, target, sheet_row, details[:2000] if details else "", status),
+            "INSERT INTO sync_log (step_id, action, source_table, target_table, row_id, details, status) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            (step_id, action, source, target, str(sheet_row), details[:2000] if details else "", status),
         )
         c.commit()
         cur.close()
