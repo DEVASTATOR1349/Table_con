@@ -1,0 +1,32 @@
+services:
+  topol:
+    build: .
+    container_name: topol-engine
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/Moscow
+    volumes:
+      - ./service_account.json:/app/service_account.json:ro
+      - ./logs:/app/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: topol-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: topol
+      POSTGRES_USER: topol
+      POSTGRES_PASSWORD: Topol2026!
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "127.0.0.1:5432:5432"
+
+volumes:
+  pgdata:
