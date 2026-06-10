@@ -31,6 +31,7 @@ def rate_limit(wait_mult=1.0):
 
 
 def api_call(fn, *args, max_retries=3, **kwargs):
+    rate_limit()
     for i in range(max_retries):
         try:
             return fn(*args, **kwargs)
@@ -66,7 +67,7 @@ class SheetsClient:
             return HEADER_CACHE[key]
         rate_limit()
         rng = "'{}'!A1:ZZ1".format(tab_name)
-        r = self.svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
+        r = api_call(lambda: self.svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute())
         rows = r.get("values", [])
         hdrs = {}
         if rows:
@@ -98,12 +99,11 @@ class SheetsClient:
             return []
 
         # Сначала узнаём сколько всего строк
-        rate_limit()
-        meta = self.svc.spreadsheets().get(
+        meta = api_call(lambda: self.svc.spreadsheets().get(
             spreadsheetId=sheet_id,
             ranges=["'" + tab_name + "'"],
             fields="sheets/data/rowData/values/userEnteredValue"
-        ).execute()
+        ).execute())
         sheets_data = meta.get("sheets", [])
         total = len(sheets_data[0].get("data", [{}])[0].get("rowData", [])) if sheets_data else 0
 
@@ -111,7 +111,7 @@ class SheetsClient:
         start = max(2, total - limit + 1)
         end_col = self._col_letter(len(headers))
         rng = "'{}'!A{}:{}{}".format(tab_name, start, end_col, total)
-        r = self.svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
+        r = api_call(lambda: self.svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute())
         rows = r.get("values", [])
         result = []
         for ri, row in enumerate(rows):
@@ -125,10 +125,9 @@ class SheetsClient:
         col_letter = self._col_letter(col + 1)
         rng = "'{}'!{}{}".format(tab_name, col_letter, row)
         body = {"values": [[value]]}
-        rate_limit()
-        self.svc.spreadsheets().values().update(
+        api_call(lambda: self.svc.spreadsheets().values().update(
             spreadsheetId=sheet_id, range=rng, body=body, valueInputOption="USER_ENTERED"
-        ).execute()
+        ).execute())
 
     def update_row(self, sheet_id: str, tab_name: str, row: int, values: dict):
         headers = self._get_headers(sheet_id, tab_name)
@@ -138,11 +137,10 @@ class SheetsClient:
 
     def append_row(self, sheet_id: str, tab_name: str, values: list):
         body = {"values": [values]}
-        rate_limit()
-        self.svc.spreadsheets().values().append(
+        api_call(lambda: self.svc.spreadsheets().values().append(
             spreadsheetId=sheet_id, range="'" + tab_name + "'!A1",
             body=body, valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS"
-        ).execute()
+        ).execute())
 
     def find_row_by_field(self, sheet_id: str, tab_name: str, field: str, value: str) -> tuple:
         """Ищет строку по значению поля. Возвращает (row_dict, row_number) или (None, None)."""
@@ -343,10 +341,13 @@ class TopolEngine:
             log.info("  Updated client table")
 
     def run_cycle(self):
+        from io import StringIO
         log.info("=" * 50)
         log.info("TOPOL cycle: " + datetime.now().isoformat())
+        self._cycle_logs = []
         total = 0
         steps_result = []
+        start_ts = time.time()
         for step in WORKFLOW["steps"]:
             try:
                 changes = self.scan_step(step)
@@ -355,6 +356,10 @@ class TopolEngine:
                     log.info("Step {}: {} — {} rows".format(step["id"], step["name"], count))
                     n = self.execute_step(changes)
                     total += n
+                    msg = "Step {}: {} — {} rows, {} actions".format(step["id"], step["name"], count, n)
+                else:
+                    msg = "Step {}: {} — no hits".format(step["id"], step["name"])
+                self._cycle_logs.append(msg)
                 steps_result.append({
                     "id": step["id"], "name": step["name"],
                     "source": step["trigger"]["source_tab"],
@@ -398,7 +403,9 @@ class TopolEngine:
 
             os.makedirs("/app/logs", exist_ok=True)
             j.dump({
-                "tables": tables_state, "steps": steps_result, "ts": datetime.now().isoformat(),
+                "tables": tables_state, "steps": steps_result,
+                "logs": getattr(self, "_cycle_logs", []),
+                "ts": datetime.now().isoformat(),
             }, open(STATE_FILE, "w"), indent=2, ensure_ascii=False)
         except Exception as e:
             log.warning("State save failed: {}".format(e))
