@@ -14,8 +14,18 @@ from config import SHEETS, WORKFLOW
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("topol")
 
-MAX_ROWS_PER_SCAN = 500  # не читать больше за раз
-HEADER_CACHE = {}  # (sid, tab) -> {col_name: col_idx}
+MAX_ROWS_PER_SCAN = 500
+HEADER_CACHE = {}
+
+
+def rate_limit():
+    """Min 1 second between Google API calls."""
+    if not hasattr(rate_limit, "_last"):
+        rate_limit._last = 0
+    elapsed = time.time() - rate_limit._last
+    if elapsed < 1.1:
+        time.sleep(1.1 - elapsed)
+    rate_limit._last = time.time()
 
 
 class SheetsClient:
@@ -23,7 +33,7 @@ class SheetsClient:
         creds = service_account.Credentials.from_service_account_file(
             creds_file, scopes=["https://www.googleapis.com/auth/spreadsheets"]
         )
-        self.svc = build("sheets", "v4", credentials=creds)
+        self.svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
 
     def _resolve(self, path: str):
         """Разбирает 'table_key/tab_key' -> (sheet_id, tab_name)"""
@@ -38,6 +48,7 @@ class SheetsClient:
         key = (sheet_id, tab_name)
         if key in HEADER_CACHE:
             return HEADER_CACHE[key]
+        rate_limit()
         rng = "'{}'!A1:ZZ1".format(tab_name)
         r = self.svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
         rows = r.get("values", [])
@@ -62,6 +73,7 @@ class SheetsClient:
             return []
 
         # Сначала узнаём сколько всего строк
+        rate_limit()
         meta = self.svc.spreadsheets().get(
             spreadsheetId=sheet_id,
             ranges=["'" + tab_name + "'"],
@@ -88,6 +100,7 @@ class SheetsClient:
         col_letter = self._col_letter(col + 1)
         rng = "'{}'!{}{}".format(tab_name, col_letter, row)
         body = {"values": [[value]]}
+        rate_limit()
         self.svc.spreadsheets().values().update(
             spreadsheetId=sheet_id, range=rng, body=body, valueInputOption="USER_ENTERED"
         ).execute()
@@ -100,6 +113,7 @@ class SheetsClient:
 
     def append_row(self, sheet_id: str, tab_name: str, values: list):
         body = {"values": [values]}
+        rate_limit()
         self.svc.spreadsheets().values().append(
             spreadsheetId=sheet_id, range="'" + tab_name + "'!A1",
             body=body, valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS"

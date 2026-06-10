@@ -14,6 +14,24 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  ui:
+    build: .
+    container_name: topol-ui
+    restart: unless-stopped
+    command: python3 -u ui.py
+    environment:
+      - TZ=Europe/Moscow
+    volumes:
+      - ./service_account.json:/app/service_account.json:ro
+      - ./logs:/app/logs
+    ports:
+      - "127.0.0.1:18889:18889"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   postgres:
     image: postgres:16-alpine
     container_name: topol-db
