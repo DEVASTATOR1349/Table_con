@@ -1,10 +1,10 @@
 """
-Тополь — PostgreSQL writer
-Дублирует все изменения из Google Sheets в SQL.
+Тополь — PostgreSQL writer + dedup engine
 """
 
 import os
 import logging
+import time
 from datetime import datetime
 
 log = logging.getLogger("topol-db")
@@ -24,11 +24,9 @@ def _conn():
 
 
 def ensure_tables():
-    """Убедиться что таблицы существуют (выполняется один раз при старте)."""
     try:
         c = _conn()
         cur = c.cursor()
-        # Core tables
         cur.execute("""
             CREATE TABLE IF NOT EXISTS scenarios (
                 id SERIAL PRIMARY KEY,
@@ -67,11 +65,12 @@ def ensure_tables():
                 id SERIAL PRIMARY KEY,
                 step_id INT, action VARCHAR(100),
                 source_table VARCHAR(255), target_table VARCHAR(255),
-                sheet_row INT, details TEXT,
+                row_id VARCHAR(50), details TEXT, hash VARCHAR(64),
                 status VARCHAR(20) DEFAULT 'ok',
                 created_at TIMESTAMP DEFAULT NOW()
             );
             CREATE INDEX IF NOT EXISTS idx_sync_log_time ON sync_log(created_at);
+            CREATE INDEX IF NOT EXISTS idx_sync_log_step_row ON sync_log(step_id, row_id);
         """)
         c.commit()
         cur.close()
@@ -81,14 +80,52 @@ def ensure_tables():
         log.warning("DB init skipped: %s", e)
 
 
-def log_sync(step_id: int, action: str, source: str, target: str, sheet_row: int, details: str = "", status: str = "ok"):
-    """Записать событие синхронизации в sync_log."""
+def _hash_row(row: dict, fields: list) -> str:
+    """Хеш полей строки для проверки изменений."""
+    import hashlib
+    vals = []
+    for f in sorted(fields):
+        vals.append(str(row.get(f, "")))
+    raw = "|".join(vals)
+    return hashlib.md5(raw.encode()).hexdigest()[:16]
+
+
+def is_processed(step_id: int, row_id: str, row: dict = None, fields: list = None) -> bool:
+    """Проверяет, был ли уже обработан этот шаг+строка (и не изменились ли поля)."""
     try:
         c = _conn()
         cur = c.cursor()
+        if row and fields:
+            h = _hash_row(row, fields)
+            cur.execute(
+                "SELECT hash FROM sync_log WHERE step_id=%s AND row_id=%s AND status='ok' ORDER BY id DESC LIMIT 1",
+                (step_id, str(row_id))
+            )
+            prev = cur.fetchone()
+            cur.close()
+            c.close()
+            return prev and prev[0] == h
+        else:
+            cur.execute(
+                "SELECT 1 FROM sync_log WHERE step_id=%s AND row_id=%s AND status='ok' LIMIT 1",
+                (step_id, str(row_id))
+            )
+            exists = cur.fetchone() is not None
+            cur.close()
+            c.close()
+            return exists
+    except:
+        return False
+
+
+def log_sync(step_id: int, action: str, source: str, target: str, sheet_row: int, details: str = "", status: str = "ok", row: dict = None, fields: list = None):
+    try:
+        c = _conn()
+        cur = c.cursor()
+        h = _hash_row(row, fields) if (row and fields) else ""
         cur.execute(
-            "INSERT INTO sync_log (step_id, action, source_table, target_table, row_id, details, status) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-            (step_id, action, source, target, str(sheet_row), details[:2000] if details else "", status),
+            "INSERT INTO sync_log (step_id, action, source_table, target_table, row_id, details, hash, status) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            (step_id, action, source, target, str(sheet_row), details[:2000] if details else "", h, status),
         )
         c.commit()
         cur.close()
@@ -98,7 +135,6 @@ def log_sync(step_id: int, action: str, source: str, target: str, sheet_row: int
 
 
 def upsert_scenario(row: dict, sheet_sid: str, sheet_tab: str):
-    """Вставить или обновить сценарий в PostgreSQL."""
     try:
         c = _conn()
         cur = c.cursor()
@@ -145,7 +181,6 @@ def upsert_scenario(row: dict, sheet_sid: str, sheet_tab: str):
 
 
 def upsert_montage(row: dict, sheet_sid: str, sheet_tab: str):
-    """Вставить или обновить задание монтажа в PostgreSQL."""
     try:
         c = _conn()
         cur = c.cursor()

@@ -20,14 +20,28 @@ HEADER_CACHE = {}
 STATE_FILE = "/app/logs/state.json"
 
 
-def rate_limit():
-    """Min 1 second between Google API calls."""
+def rate_limit(wait_mult=1.0):
     if not hasattr(rate_limit, "_last"):
         rate_limit._last = 0
+    gap = 1.1 * wait_mult
     elapsed = time.time() - rate_limit._last
-    if elapsed < 1.1:
-        time.sleep(1.1 - elapsed)
+    if elapsed < gap:
+        time.sleep(gap - elapsed)
     rate_limit._last = time.time()
+
+
+def api_call(fn, *args, max_retries=3, **kwargs):
+    for i in range(max_retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if "429" in str(e) and i < max_retries - 1:
+                backoff = 2 ** (i + 2)
+                log.warning("Rate limit (429), retrying in {}s...".format(backoff))
+                rate_limit._last = time.time()
+                time.sleep(backoff)
+                continue
+            raise
 
 
 class SheetsClient:
@@ -155,10 +169,31 @@ class TopolEngine:
             return []
 
         changes = []
+        skipped = 0
         for rd in rows:
             if self._check_trigger(rd, trigger):
+                rn = str(rd.get("_row", ""))
+                # Dedup: skip if already processed with same hash
+                trigger_fields = self._trigger_fields(trigger)
+                if db.is_processed(step["id"], rn, rd, trigger_fields):
+                    skipped += 1
+                    continue
                 changes.append({"row": rd, "step": step})
+        if skipped:
+            log.info("  Step {}: {} skipped (already processed)".format(step["id"], skipped))
         return changes
+
+    def _trigger_fields(self, trigger: dict) -> list:
+        """Extract field names from trigger for hashing."""
+        fields = []
+        if trigger.get("status_col"):
+            fields.append(trigger["status_col"])
+        f = trigger.get("fields", [])
+        if isinstance(f, dict):
+            fields.extend(f.keys())
+        elif isinstance(f, list):
+            fields.extend(f)
+        return fields
 
     def _check_trigger(self, row: dict, trigger: dict) -> bool:
         sc = trigger.get("status_col")
@@ -220,8 +255,10 @@ class TopolEngine:
                     log.info("  [NOTIFY] Row {} ready for montage".format(row.get("_row")))
 
                 # Write to SQL
+                trigger_fields = self._trigger_fields(step["trigger"])
                 db.log_sync(step["id"], action, src, tgt, row.get("_row", 0),
-                    f"Row {row.get('_row')}: {row.get('ID', row.get('Проект', ''))}")
+                    "Row {}: {}".format(row.get("_row"), row.get("ID", row.get("Проект", ""))),
+                    row=row, fields=trigger_fields)
                 # Upsert row data into scenarios or montage_tasks
                 self._sql_upsert(row, src)
 
