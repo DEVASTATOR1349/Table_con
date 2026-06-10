@@ -176,11 +176,23 @@ class TopolEngine:
                 return False
 
         if fields:
-            results = []
-            for f in fields:
-                val = str(row.get(f, "")).strip()
-                results.append(bool(val and val not in ("—", "-", "")))
-            return all(results) if cond == "ALL" else any(results)
+            if isinstance(fields, dict):
+                # dict: {"col": "value_or_filled"} — проверяем точное значение
+                results = []
+                for col, expected in fields.items():
+                    actual = str(row.get(col, "")).strip()
+                    if str(expected).strip() == "filled":
+                        results.append(bool(actual and actual not in ("—", "-", "")))
+                    else:
+                        results.append(actual == str(expected).strip())
+                return all(results) if cond == "ALL" else any(results)
+            else:
+                # list: ["col1", "col2"] — проверяем непустоту
+                results = []
+                for col in fields:
+                    val = str(row.get(col, "")).strip()
+                    results.append(bool(val and val not in ("—", "-", "")))
+                return all(results) if cond == "ALL" else any(results)
 
         return True if (sc or fields) else False
 
