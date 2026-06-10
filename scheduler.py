@@ -7,6 +7,7 @@ import logging
 from datetime import datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
 from engine import SheetsClient, TopolEngine
+import db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("topol-scheduler")
@@ -24,6 +25,7 @@ def run_cycle():
 
 def main():
     log.info("TOPOL scheduler starting (every {} min)".format(INTERVAL_MINUTES))
+    db.ensure_tables()
     scheduler = BlockingScheduler(timezone="Europe/Moscow")
     scheduler.add_job(run_cycle, "interval", minutes=INTERVAL_MINUTES, next_run_time=datetime.now())
     try:

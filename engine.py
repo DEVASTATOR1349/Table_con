@@ -10,6 +10,7 @@ from typing import Optional, Dict, List, Any
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from config import SHEETS, WORKFLOW
+import db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("topol")
@@ -180,6 +181,8 @@ class TopolEngine:
             step = ch["step"]
             row = ch["row"]
             action = step["action"]
+            src = step["trigger"]["source_tab"]
+            tgt = step.get("target", "—")
 
             try:
                 if action in ("copy_to_client", "send_to_client"):
@@ -194,11 +197,28 @@ class TopolEngine:
                     self._update_client(row, step)
                 elif action == "notify_manager":
                     log.info("  [NOTIFY] Row {} ready for montage".format(row.get("_row")))
+
+                # Write to SQL
+                db.log_sync(step["id"], action, src, tgt, row.get("_row", 0),
+                    f"Row {row.get('_row')}: {row.get('ID', row.get('Проект', ''))}")
+                # Upsert row data into scenarios or montage_tasks
+                self._sql_upsert(row, src)
+
                 count += 1
             except Exception as e:
                 log.error("  Step {} failed on row {}: {}".format(step["id"], row.get("_row"), e))
+                db.log_sync(step["id"], action, src, tgt, row.get("_row", 0), str(e)[:500], "error")
 
         return count
+
+    def _sql_upsert(self, row: dict, source_path: str):
+        """Определить тип по источнику и записать в правильную SQL таблицу."""
+        if "nomos_scenarios" in source_path or "main" in source_path or "Номос" in source_path:
+            sid, tab = self.client._resolve(source_path)
+            db.upsert_scenario(row, sid, tab)
+        elif "montage_reference" in source_path or "СценарииСбор" in source_path or "Монтаж" in source_path:
+            sid, tab = self.client._resolve(source_path)
+            db.upsert_montage(row, sid, tab)
 
     def _copy_to_target(self, row: dict, step: dict):
         target_path = step["target"]
