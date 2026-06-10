@@ -16,6 +16,7 @@ log = logging.getLogger("topol")
 
 MAX_ROWS_PER_SCAN = 500
 HEADER_CACHE = {}
+STATE_FILE = "/app/logs/state.json"
 
 
 def rate_limit():
@@ -267,16 +268,62 @@ class TopolEngine:
         log.info("=" * 50)
         log.info("TOPOL cycle: " + datetime.now().isoformat())
         total = 0
+        steps_result = []
         for step in WORKFLOW["steps"]:
             try:
                 changes = self.scan_step(step)
+                count = len(changes)
                 if changes:
-                    log.info("Step {}: {} — {} rows".format(step["id"], step["name"], len(changes)))
+                    log.info("Step {}: {} — {} rows".format(step["id"], step["name"], count))
                     n = self.execute_step(changes)
                     total += n
+                steps_result.append({
+                    "id": step["id"], "name": step["name"],
+                    "source": step["trigger"]["source_tab"],
+                    "target": step.get("target", "—"), "count": count,
+                })
             except Exception as e:
                 log.error("Step {} ERROR: {}".format(step["id"], e))
+                steps_result.append({
+                    "id": step["id"], "name": step["name"],
+                    "source": "?", "target": "?", "count": 0,
+                })
         log.info("Cycle done: {} actions".format(total))
+
+        # Save state for UI (via shared volume)
+        self._save_state(steps_result)
+        return steps_result
+
+    def _save_state(self, steps_result):
+        try:
+            import json as j, os
+            tables_state = []
+            scan_map = [
+                ("nomos_scenarios", "Номос", "Номос Сценарии"),
+                ("montage_reference", "СценарииСбор", "Спр_Монтаж"),
+                ("ai4_report", "Сценарии", "AI4 отчёт"),
+                ("montager_mikhail", "ЗаданияV2", "Монтажёр Михаил"),
+            ]
+            for tk, tn, label in scan_map:
+                try:
+                    sid = SHEETS[tk]["id"]
+                    h = self.client._get_headers(sid, tn)
+                    rows = self.client.get_recent_rows(sid, tn)
+                    tables_state.append({
+                        "label": label, "tab": tn, "cols": len(h),
+                        "last_row": rows[-1]["_row"] if rows else "—",
+                        "total_rows": "~" + str(rows[-1]["_row"] if rows else 0),
+                        "scanned": len(rows),
+                    })
+                except Exception as e:
+                    tables_state.append({"label": label, "tab": tn, "cols": "?", "last_row": "?", "total_rows": "?", "scanned": "?", "error": str(e)[:100]})
+
+            os.makedirs("/app/logs", exist_ok=True)
+            j.dump({
+                "tables": tables_state, "steps": steps_result, "ts": datetime.now().isoformat(),
+            }, open(STATE_FILE, "w"), indent=2, ensure_ascii=False)
+        except Exception as e:
+            log.warning("State save failed: {}".format(e))
 
 
 def main():
