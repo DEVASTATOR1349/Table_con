@@ -192,28 +192,28 @@ def upsert_montage(row: dict, sheet_sid: str, sheet_tab: str):
             row_id, sheet_sid, sheet_tab,
             str(row.get("Проект", "")), str(row.get("Сценарист", "")),
             str(row.get("Текст на обложке", "")), str(row.get("Сценарий", "")),
-            str(row.get("Дата дедлайна", "")), str(row.get("Ссылка с исходником и обложкой", "")),
-            str(row.get("Фирменный стиль клиента", "")), str(row.get("ТЗ для монтажа", "")),
-            str(row.get("ТЗ монтажа доп", "")),
-            str(row.get("Статус Сценариста", "")), str(row.get("Комментарий Сценариста", "")),
-            str(row.get("Одобрение исходника", "")), str(row.get("Комментарий", "")),
-            str(row.get("Выбор монтажера", "")), str(row.get("Цена монтажа", "")),
-            str(row.get("Ссылка с Готовым материалом", "")),
-            str(row.get("Статус монтажера", "")), str(row.get("Комментарий Монтажёра", row.get("Коммент От  монтажора", ""))),
-            str(row.get("Одобрение", "")), str(row.get("Коментарий Ответственного по монтажу", "")),
-            str(row.get("Дата Готового монтажа", "")),
-            str(row.get("Одобрение клиента", "")), str(row.get("Комент клиента", "")),
+            str(row.get("Дата дедлайна", "") or ""), str(row.get("Ссылка с исходником и обложкой", "") or ""),
+            str(row.get("Фирменный стиль клиента", "") or ""), str(row.get("ТЗ для монтажа", "") or ""),
+            str(row.get("ТЗ монтажа доп", "") or ""),
+            str(row.get("Статус Сценариста", "") or ""), str(row.get("Комментарий Сценариста", "") or ""),
+            str(row.get("Одобрение исходника", "") or ""), str(row.get("Комментарий", "") or ""),
+            str(row.get("Выбор монтажера", "") or ""), str(row.get("Цена монтажа", "") or ""),
+            str(row.get("Ссылка с Готовым материалом", "") or ""),
+            str(row.get("Статус монтажера", "") or ""), str(row.get("Комментарий Монтажёра", row.get("Коммент От  монтажора", "")) or ""),
+            str(row.get("Одобрение", "") or ""), str(row.get("Коментарий Ответственного по монтажу", "") or ""),
+            str(row.get("Дата Готового монтажа", "") or ""),
+            str(row.get("Одобрение клиента", "") or ""), str(row.get("Комент клиента", "") or ""),
         )
         if existing:
             cur.execute("""
                 UPDATE montage_tasks SET project=%s, scenarist=%s, cover_text=%s,
-                    scenario_text=%s, deadline=%s::date, source_link=%s,
+                    scenario_text=%s, deadline=NULLIF(%s,'')::date, source_link=%s,
                     client_style=%s, montage_tz=%s, montage_tz_extra=%s,
                     status_scenarist=%s, comment_scenarist=%s,
                     source_approved=%s, comment_source=%s, montager=%s,
                     price=%s, ready_link=%s, status_montager=%s,
                     comment_montager=%s, approved=%s, comment_manager=%s,
-                    ready_date=%s::date, client_approved=%s, client_comment=%s,
+                    ready_date=NULLIF(%s,'')::date, client_approved=%s, client_comment=%s,
                     updated_at=NOW()
                 WHERE id=%s
             """, (*values[3:], existing[0]))
@@ -225,7 +225,7 @@ def upsert_montage(row: dict, sheet_sid: str, sheet_tab: str):
                     status_scenarist, comment_scenarist, source_approved, comment_source,
                     montager, price, ready_link, status_montager, comment_montager,
                     approved, comment_manager, ready_date, client_approved, client_comment)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s::date,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::date,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,NULLIF(%s,'')::date,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NULLIF(%s,'')::date,%s,%s)
             """, values)
         c.commit()
         cur.close()
