@@ -2,12 +2,13 @@
 Тополь Scheduler — APScheduler каждые 5 минут + лог в БД
 """
 
-import logging, io
+import logging, io, os, json as j
 from datetime import datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
 from engine import SheetsClient, TopolEngine
 from config import SHEETS, WORKFLOW
-import requests
+
+STATE_FILE = "/app/logs/state.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("topol-scheduler")
@@ -20,7 +21,6 @@ def run_cycle():
         engine = TopolEngine(client)
 
         # Collect log lines
-        import io
         log_stream = io.StringIO()
         handler = logging.StreamHandler(log_stream)
         handler.setLevel(logging.INFO)
@@ -62,14 +62,12 @@ def run_cycle():
             except:
                 steps_state.append({"id": step["id"], "name": step["name"], "source": "?", "target": "?", "count": 0})
 
-        # Save to UI
-        import requests
-        try:
-            requests.post("http://127.0.0.1:18889/api/state/save", json={
-                "tables": tables_state, "steps": steps_state, "logs": log_lines,
-            }, timeout=10)
-        except:
-            pass
+        # Save to shared volume (UI reads from same file)
+        os.makedirs("/app/logs", exist_ok=True)
+        j.dump({
+            "tables": tables_state, "steps": steps_state, "logs": log_lines,
+            "ts": datetime.now().isoformat(),
+        }, open(STATE_FILE, "w"), indent=2, ensure_ascii=False)
 
     except Exception as e:
         log.error("Cycle crashed: {}".format(e))

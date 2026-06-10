@@ -10,15 +10,14 @@ from jinja2 import Template
 
 app = FastAPI(title="Тополь — Dashboard")
 
-STATE_FILE = "/app/logs/state.json"
+STATE_FILE = os.environ.get("STATE_FILE", "/app/logs/state.json")
 
 def get_cached_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            return json.load(open(STATE_FILE))
-        except:
-            pass
-    return None
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except:
+        return None
 
 
 HTML = """<!DOCTYPE html>
