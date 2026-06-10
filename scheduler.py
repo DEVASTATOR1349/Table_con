@@ -1,44 +1,38 @@
 """
-Тополь Scheduler — запускает engine каждые 5 минут
+Тополь Scheduler — APScheduler каждые 5 минут + лог в БД
 """
 
-import time
-import signal
 import logging
 from datetime import datetime
+from apscheduler.schedulers.blocking import BlockingScheduler
 from engine import SheetsClient, TopolEngine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("topol-scheduler")
 
-INTERVAL = 300  # 5 минут
+INTERVAL_MINUTES = 5
+
+def run_cycle():
+    try:
+        client = SheetsClient()
+        engine = TopolEngine(client)
+        engine.run_cycle()
+    except Exception as e:
+        log.error("Cycle crashed: {}".format(e))
+
 
 def main():
-    log.info("ТОПОЛЬ scheduler started (interval: {}s)".format(INTERVAL))
-    client = SheetsClient()
-    engine = TopolEngine(client)
+    log.info("TOPOL scheduler starting (every {} min)".format(INTERVAL_MINUTES))
+    scheduler = BlockingScheduler(timezone="Europe/Moscow")
 
-    running = True
-    def handler(sig, frame):
-        nonlocal running
-        running = False
-        log.info("Shutting down...")
+    # Первый запуск через 5 секунд после старта, потом каждые N минут
+    scheduler.add_job(run_cycle, "interval", minutes=INTERVAL_MINUTES, next_run_time=datetime.now())
 
-    signal.signal(signal.SIGTERM, handler)
-    signal.signal(signal.SIGINT, handler)
+    try:
+        scheduler.start()
+    except (KeyboardInterrupt, SystemExit):
+        log.info("TOPOL stopped")
 
-    while running:
-        try:
-            engine.run_cycle()
-        except Exception as e:
-            log.error("Cycle failed: {}".format(e))
-
-        for _ in range(INTERVAL):
-            if not running:
-                break
-            time.sleep(1)
-
-    log.info("ТОПОЛЬ stopped")
 
 if __name__ == "__main__":
     main()
