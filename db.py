@@ -232,3 +232,40 @@ def upsert_montage(row: dict, sheet_sid: str, sheet_tab: str):
         c.close()
     except Exception as e:
         log.warning("upsert_montage failed: %s", e)
+
+
+def execute(sql, params=None):
+    """Выполнить SQL, commit, вернуть cursor."""
+    c = _conn()
+    cur = c.cursor()
+    try:
+        cur.execute(sql, params)
+        c.commit()
+        return cur
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+
+
+def fetch(sql, params=None):
+    """Выполнить SELECT, вернуть список строк."""
+    c = _conn()
+    cur = c.cursor()
+    try:
+        cur.execute(sql, params)
+        return cur.fetchall()
+    finally:
+        c.close()
+
+
+def fetchone(sql, params=None):
+    """Выполнить SELECT, вернуть одну строку или None."""
+    c = _conn()
+    cur = c.cursor()
+    try:
+        cur.execute(sql, params)
+        return cur.fetchone()
+    finally:
+        c.close()

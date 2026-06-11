@@ -1,7 +1,7 @@
 """
 Тополь — Table Sync Engine v2
-Автоматическая синхронизация между 4 таблицами Google Sheets.
-Оптимизировано для больших таблиц (лимит строк, кеш заголовков).
+Автоматическая синхронизация между Google Sheets.
+Динамическая маршрутизация заданий монтажёрам.
 """
 
 import os, json, time, logging
@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional, Dict, List, Any
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from config import SHEETS, WORKFLOW
+from config import SHEETS, WORKFLOW, MONTAGER_SHEETS, MONTAGER_ALIASES
 import db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -18,6 +18,19 @@ log = logging.getLogger("topol")
 MAX_ROWS_PER_SCAN = 500
 HEADER_CACHE = {}
 STATE_FILE = "/app/logs/state.json"
+
+MONTAGER_TAB = "ЗаданияV2"  # Единый таб для всех монтажёров
+
+COLLECTOR_SHEET_ID = SHEETS["montage_reference"]["id"]
+COLLECTOR_TAB = "МонтажерыРаспределение"
+
+# Системные табы — пропускаем при сканировании клиентских
+SYSTEM_TABS = {
+    "Обзор","Обучение","БазаДанных","РасчетЗП","ОтчетныйЛист",
+    "СценарииСбор","СценарииV2М","Лист61","СценарииV3",
+    "ПублицистыV3","ПарсПублицистов","СпрКлиент","СпрКлиентСцен",
+    "МонтжерыV2М","МонтажерыРаспределение",
+}
 
 
 def rate_limit(wait_mult=1.0):
@@ -73,12 +86,10 @@ class SheetsClient:
         if rows:
             for i, h in enumerate(rows[0]):
                 raw = str(h).strip()
-                # Normalize: remove trailing numbers, collapse whitespace/newlines
                 import re
-                norm = re.sub(r'\s*\d+\s*$', '', raw)  # strip trailing number
-                norm = re.sub(r'\s+', ' ', norm).strip()  # collapse spaces/newlines
+                norm = re.sub(r'\s*\d+\s*$', '', raw)
+                norm = re.sub(r'\s+', ' ', norm).strip()
                 if norm:
-                    # Always store by normalized name, allowing overwrite by explicit match
                     current = hdrs.get(norm)
                     if current is None or len(raw) > len(str(rows[0][current]).strip()):
                         hdrs[norm] = i
@@ -93,12 +104,11 @@ class SheetsClient:
         return result
 
     def get_recent_rows(self, sheet_id: str, tab_name: str, limit: int = MAX_ROWS_PER_SCAN) -> List[Dict]:
-        """Читает последние N строк (снизу). Быстро даже для таблиц на 16K строк."""
+        """Читает последние N строк (снизу)."""
         headers = self._get_headers(sheet_id, tab_name)
         if not headers:
             return []
 
-        # Сначала узнаём сколько всего строк
         meta = api_call(lambda: self.svc.spreadsheets().get(
             spreadsheetId=sheet_id,
             ranges=["'" + tab_name + "'"],
@@ -107,7 +117,6 @@ class SheetsClient:
         sheets_data = meta.get("sheets", [])
         total = len(sheets_data[0].get("data", [{}])[0].get("rowData", [])) if sheets_data else 0
 
-        # Читаем последние limit строк (или все, если их меньше)
         start = max(2, total - limit + 1)
         end_col = self._col_letter(len(headers))
         rng = "'{}'!A{}:{}{}".format(tab_name, start, end_col, total)
@@ -158,6 +167,15 @@ class TopolEngine:
     def scan_step(self, step: dict) -> list:
         trigger = step["trigger"]
         source_path = trigger["source_tab"]
+        action = step["action"]
+
+        # Step 6: сканируем ВСЕХ доступных монтажёров
+        if action == "sync_montager_bidirectional":
+            return self._scan_montagers_for_changes(step)
+
+        if action == "import_client_tabs":
+            return [{"row": {"_row": "all"}, "step": step}]
+
         sid, tab = self.client._resolve(source_path)
 
         try:
@@ -171,7 +189,6 @@ class TopolEngine:
         for rd in rows:
             if self._check_trigger(rd, trigger):
                 rn = str(rd.get("_row", ""))
-                # Dedup: skip if already processed with same hash
                 trigger_fields = self._trigger_fields(trigger)
                 if db.is_processed(step["id"], rn, rd, trigger_fields):
                     skipped += 1
@@ -181,8 +198,56 @@ class TopolEngine:
             log.info("  Step {}: {} skipped (already processed)".format(step["id"], skipped))
         return changes
 
+    def _scan_montagers_for_changes(self, step: dict) -> list:
+        """Сканирует ЗаданияV2 всех доступных монтажёров на изменения статуса/комментария."""
+        changes = []
+        fields_to_sync = step["trigger"].get("fields", [])
+        skipped = 0
+        accessible = sum(1 for m in MONTAGER_SHEETS.values() if m.get("access", False))
+
+        for mname, minfo in MONTAGER_SHEETS.items():
+            if not minfo.get("access", False):
+                continue
+            try:
+                rows = self.client.get_recent_rows(minfo["id"], MONTAGER_TAB, limit=200)
+            except Exception as e:
+                log.debug("  Cannot read {} ({}): {}".format(mname, minfo["id"], str(e)[:80]))
+                continue
+
+            for rd in rows:
+                row_id = str(rd.get("ID", "")).strip()
+                if not row_id:
+                    continue
+
+                has_data = False
+                for f in fields_to_sync:
+                    val = str(rd.get(f, "")).strip()
+                    if val and val not in ("—", "-", ""):
+                        has_data = True
+                        break
+                if not has_data:
+                    continue
+
+                # Дедупликация: уникальный ключ = mname:row_id
+                dedup_key = "{}:{}".format(mname, row_id)
+                mini_row = {f: str(rd.get(f, "")) for f in fields_to_sync}
+                if db.is_processed(step["id"], dedup_key, mini_row, fields_to_sync):
+                    skipped += 1
+                    continue
+
+                changes.append({
+                    "row": rd,
+                    "step": step,
+                    "montager_name": mname,
+                    "montager_sid": minfo["id"],
+                    "dedup_key": dedup_key,
+                })
+
+        log.info("  Montager scan: {} new changes ({} skipped) across {} accessible montagers".format(
+            len(changes), skipped, accessible))
+        return changes
+
     def _trigger_fields(self, trigger: dict) -> list:
-        """Extract field names from trigger for hashing."""
         fields = []
         if trigger.get("status_col"):
             fields.append(trigger["status_col"])
@@ -210,7 +275,6 @@ class TopolEngine:
 
         if fields:
             if isinstance(fields, dict):
-                # dict: {"col": "value_or_filled"} — проверяем точное значение
                 results = []
                 for col, expected in fields.items():
                     actual = str(row.get(col, "")).strip()
@@ -220,7 +284,6 @@ class TopolEngine:
                         results.append(actual == str(expected).strip())
                 return all(results) if cond == "ALL" else any(results)
             else:
-                # list: ["col1", "col2"] — проверяем непустоту
                 results = []
                 for col in fields:
                     val = str(row.get(col, "")).strip()
@@ -245,19 +308,31 @@ class TopolEngine:
                     self._sync_fields(row, step)
                 elif action == "assign_to_montager":
                     self._assign_montager(row, step)
+                elif action == "sync_montager_bidirectional":
+                    mname = ch.get("montager_name", "?")
+                    msid = ch.get("montager_sid", "")
+                    self._sync_from_montager(row, mname, msid, step)
+                    # Логируем с уникальным dedup_key
+                    trigger_fields = self._trigger_fields(step["trigger"])
+                    db.log_sync(step["id"], action, src, tgt,
+                        ch.get("dedup_key", "unknown"),
+                        "Montager {}: ID {}".format(mname, row.get("ID", "")),
+                        row=row, fields=trigger_fields)
+                    count += 1
+                    continue  # skip generic log below
                 elif action == "send_to_scenarist":
                     self._send_to_scenarist(row, step)
                 elif action == "update_client_table":
                     self._update_client(row, step)
+
                 elif action == "notify_manager":
                     log.info("  [NOTIFY] Row {} ready for montage".format(row.get("_row")))
 
-                # Write to SQL
+                # Generic SQL log (not for montager_bidirectional — handled above)
                 trigger_fields = self._trigger_fields(step["trigger"])
                 db.log_sync(step["id"], action, src, tgt, row.get("_row", 0),
                     "Row {}: {}".format(row.get("_row"), row.get("ID", row.get("Проект", ""))),
                     row=row, fields=trigger_fields)
-                # Upsert row data into scenarios or montage_tasks
                 self._sql_upsert(row, src)
 
                 count += 1
@@ -268,7 +343,6 @@ class TopolEngine:
         return count
 
     def _sql_upsert(self, row: dict, source_path: str):
-        """Определить тип по источнику и записать в правильную SQL таблицу."""
         if "nomos_scenarios" in source_path or "main" in source_path or "Номос" in source_path:
             sid, tab = self.client._resolve(source_path)
             db.upsert_scenario(row, sid, tab)
@@ -304,17 +378,61 @@ class TopolEngine:
                 log.info("  Synced {} fields to {} row {}".format(len(updates), tab, tn))
 
     def _assign_montager(self, row: dict, step: dict):
-        target_path = step["target"]
-        sid, tab = self.client._resolve(target_path)
-        mn = row.get("Выбор монтажера", "")
-        if mn:
-            self.client.append_row(sid, tab, [
-                datetime.now().strftime("%d.%m.%Y"),
-                str(row.get("ID", "")),
-                str(row.get("Проект", "")),
-                mn,
-            ])
-            log.info("  Assigned to montager: " + mn)
+        """Динамическая маршрутизация задания к монтажёру по имени из 'Выбор монтажера'."""
+        mn = str(row.get("Выбор монтажера", "")).strip()
+        if not mn:
+            return
+
+        mn_key = mn.replace(" ", "")
+
+        # Алиас
+        if mn_key in MONTAGER_ALIASES:
+            mn_key = MONTAGER_ALIASES[mn_key]
+
+        now_str = datetime.now().strftime("%d.%m.%Y")
+        row_data = [
+            now_str,
+            str(row.get("ID", "")),
+            str(row.get("Проект", "")),
+            mn,
+        ]
+
+        if mn_key in MONTAGER_SHEETS:
+            minfo = MONTAGER_SHEETS[mn_key]
+            if minfo.get("access", False):
+                self.client.append_row(minfo["id"], MONTAGER_TAB, row_data)
+                log.info("  ➡ {} → {} (ID {})".format(mn, mn_key, row.get("ID", "?")))
+                return
+            else:
+                log.warning("  ⚠ {}: нет доступа, пишу в коллектор".format(mn))
+        else:
+            log.warning("  ⚠ {}: нет в MONTAGER_SHEETS, пишу в коллектор".format(mn))
+
+        self.client.append_row(COLLECTOR_SHEET_ID, COLLECTOR_TAB, row_data)
+        log.info("  📋 {} → коллектор".format(mn))
+
+    def _sync_from_montager(self, row: dict, mname: str, msid: str, step: dict):
+        """Синхронизирует поля из таблицы монтажёра обратно в СценарииСбор."""
+        fields = step["trigger"].get("fields", [])
+        ref_sid = SHEETS["montage_reference"]["id"]
+        ref_tab = "СценарииСбор"
+        row_id = str(row.get("ID", "")).strip()
+        if not row_id:
+            return
+
+        tr, tn = self.client.find_row_by_field(ref_sid, ref_tab, "ID", row_id)
+        if tr:
+            updates = {}
+            for f in fields:
+                if f in row:
+                    val = str(row.get(f, "")).strip()
+                    if val:
+                        updates[f] = val
+            if updates:
+                self.client.update_row(ref_sid, ref_tab, tn, updates)
+                log.info("  🔄 {} → reference: {} fields for ID {}".format(mname, len(updates), row_id))
+        else:
+            log.debug("  ID {} not found in reference table".format(row_id))
 
     def _send_to_scenarist(self, row: dict, step: dict):
         target_path = step["target"]
@@ -340,14 +458,13 @@ class TopolEngine:
             })
             log.info("  Updated client table")
 
+
     def run_cycle(self):
-        from io import StringIO
         log.info("=" * 50)
         log.info("TOPOL cycle: " + datetime.now().isoformat())
         self._cycle_logs = []
         total = 0
         steps_result = []
-        start_ts = time.time()
         for step in WORKFLOW["steps"]:
             try:
                 changes = self.scan_step(step)
@@ -372,20 +489,16 @@ class TopolEngine:
                     "source": "?", "target": "?", "count": 0,
                 })
         log.info("Cycle done: {} actions".format(total))
-
-        # Save state for UI (via shared volume)
         self._save_state(steps_result)
         return steps_result
 
     def _save_state(self, steps_result):
         try:
-            import json as j, os
             tables_state = []
             scan_map = [
                 ("nomos_scenarios", "Номос", "Номос Сценарии"),
                 ("montage_reference", "СценарииСбор", "Спр_Монтаж"),
                 ("ai4_report", "Сценарии", "AI4 отчёт"),
-                ("montager_mikhail", "ЗаданияV2", "Монтажёр Михаил"),
             ]
             for tk, tn, label in scan_map:
                 try:
@@ -402,7 +515,7 @@ class TopolEngine:
                     tables_state.append({"label": label, "tab": tn, "cols": "?", "last_row": "?", "total_rows": "?", "scanned": "?", "error": str(e)[:100]})
 
             os.makedirs("/app/logs", exist_ok=True)
-            j.dump({
+            json.dump({
                 "tables": tables_state, "steps": steps_result,
                 "logs": getattr(self, "_cycle_logs", []),
                 "ts": datetime.now().isoformat(),

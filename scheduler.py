@@ -12,7 +12,7 @@ import db
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("topol-scheduler")
 
-INTERVAL_MINUTES = 5
+INTERVAL_MINUTES = 10
 
 def run_cycle():
     try:
