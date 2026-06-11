@@ -5,6 +5,17 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Europe/Moscow
+      # SAFE BY DEFAULT: writes are simulated only. Set to 0 for production writes.
+      - TOPOL_DRY_RUN=1
+      # Circuit breaker: max sheet writes per cycle before the cycle aborts.
+      - TOPOL_MAX_WRITES=50
+      # Scan only the last N rows per tab (speed + old rows are never touched).
+      - TOPOL_SCAN_ROWS=30
+      # Main sync cycle cadence (min) and hourly backfill of missing rows.
+      - TOPOL_INTERVAL_MINUTES=10
+      - TOPOL_BACKFILL_MINUTES=60
+      # Max rows backfill adds per run (rest drains over the next runs).
+      - TOPOL_BACKFILL_MAX=200
     volumes:
       - ./service_account.json:/app/service_account.json:ro
       - ./logs:/app/logs

@@ -15,9 +15,25 @@ import db
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("topol")
 
-MAX_ROWS_PER_SCAN = 500
+# Сколько последних строк сканировать. Узкое окно = быстро + старые строки
+# (выше окна) НЕ читаются и НЕ трогаются: работаем только по свежим/в работе.
+SCAN_ROWS = int(os.environ.get("TOPOL_SCAN_ROWS", "30"))
+MAX_ROWS_PER_SCAN = SCAN_ROWS  # back-compat alias
 HEADER_CACHE = {}
 STATE_FILE = "/app/logs/state.json"
+
+# --- Safety guards -------------------------------------------------------
+# DRY_RUN: when on, the engine logs every write it WOULD do but never touches
+# a sheet. Default ON — must be explicitly disabled to write to production.
+DRY_RUN = os.environ.get("TOPOL_DRY_RUN", "1").strip().lower() not in ("0", "false", "no", "off", "")
+# Circuit breaker: hard ceiling on writes (cell updates + appends) per cycle.
+# A bulk import that tries to fan thousands of changes out (the Step-0
+# incident: 6038 montager assignments) trips this and aborts the cycle.
+MAX_WRITES_PER_CYCLE = int(os.environ.get("TOPOL_MAX_WRITES", "50"))
+
+
+class CircuitBreakerTripped(Exception):
+    """Raised when a single cycle exceeds MAX_WRITES_PER_CYCLE. Aborts the cycle."""
 
 MONTAGER_TAB = "ЗаданияV2"  # Единый таб для всех монтажёров
 
@@ -64,6 +80,31 @@ class SheetsClient:
             creds_file, scopes=["https://www.googleapis.com/auth/spreadsheets"]
         )
         self.svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        self.dry_run = DRY_RUN
+        self.writes_this_cycle = 0
+        if self.dry_run:
+            log.warning("DRY_RUN is ON — no writes will reach the sheets. Set TOPOL_DRY_RUN=0 to enable writes.")
+
+    def reset_write_counter(self):
+        self.writes_this_cycle = 0
+
+    def _allow_write(self, desc: str) -> bool:
+        """Gate every write through the circuit breaker and dry-run flag.
+
+        Returns True if the caller should perform the real API write,
+        False if it must be skipped (dry-run). Raises CircuitBreakerTripped
+        once the per-cycle write ceiling is exceeded.
+        """
+        self.writes_this_cycle += 1
+        if self.writes_this_cycle > MAX_WRITES_PER_CYCLE:
+            raise CircuitBreakerTripped(
+                "More than {} writes in one cycle — aborting to prevent runaway. Last: {}".format(
+                    MAX_WRITES_PER_CYCLE, desc)
+            )
+        if self.dry_run:
+            log.info("  [DRY-RUN] would write: {}".format(desc))
+            return False
+        return True
 
     def _resolve(self, path: str):
         """Разбирает 'table_key/tab_key' -> (sheet_id, tab_name)"""
@@ -109,16 +150,24 @@ class SheetsClient:
         if not headers:
             return []
 
-        meta = api_call(lambda: self.svc.spreadsheets().get(
-            spreadsheetId=sheet_id,
-            ranges=["'" + tab_name + "'"],
-            fields="sheets/data/rowData/values/userEnteredValue"
-        ).execute())
-        sheets_data = meta.get("sheets", [])
-        total = len(sheets_data[0].get("data", [{}])[0].get("rowData", [])) if sheets_data else 0
+        # Дешёвый подсчёт числа строк: колонка A, обрезанная до последней
+        # непустой. Раньше ради подсчёта тянулся весь rowData листа
+        # (userEnteredValue) — медленно. Допущение: колонка A заполнена у каждой
+        # строки с данными (в этих таблицах это ID/дата/проект).
+        rate_limit()
+        colA = api_call(lambda: self.svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id, range="'{}'!A:A".format(tab_name)).execute())
+        total = len(colA.get("values", []))
+        if total < 2:
+            return []
 
         start = max(2, total - limit + 1)
-        end_col = self._col_letter(len(headers))
+        # Header indices come from the full A1:ZZ1 row, so the read range must
+        # span up to the largest mapped index — NOT len(headers). Using the
+        # count drops the rightmost columns whenever any header cell is blank
+        # or two headers collapse to one normalized name.
+        max_idx = max(headers.values()) if headers else 0
+        end_col = self._col_letter(max_idx + 1)
         rng = "'{}'!A{}:{}{}".format(tab_name, start, end_col, total)
         r = api_call(lambda: self.svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute())
         rows = r.get("values", [])
@@ -133,6 +182,8 @@ class SheetsClient:
     def update_cell(self, sheet_id: str, tab_name: str, row: int, col: int, value: str):
         col_letter = self._col_letter(col + 1)
         rng = "'{}'!{}{}".format(tab_name, col_letter, row)
+        if not self._allow_write("update {} {} = {!r}".format(tab_name, rng, str(value)[:60])):
+            return
         body = {"values": [[value]]}
         api_call(lambda: self.svc.spreadsheets().values().update(
             spreadsheetId=sheet_id, range=rng, body=body, valueInputOption="USER_ENTERED"
@@ -145,6 +196,8 @@ class SheetsClient:
                 self.update_cell(sheet_id, tab_name, row, headers[col_name], val)
 
     def append_row(self, sheet_id: str, tab_name: str, values: list):
+        if not self._allow_write("append to {} : {}".format(tab_name, values)):
+            return
         body = {"values": [values]}
         api_call(lambda: self.svc.spreadsheets().values().append(
             spreadsheetId=sheet_id, range="'" + tab_name + "'!A1",
@@ -209,7 +262,7 @@ class TopolEngine:
             if not minfo.get("access", False):
                 continue
             try:
-                rows = self.client.get_recent_rows(minfo["id"], MONTAGER_TAB, limit=200)
+                rows = self.client.get_recent_rows(minfo["id"], MONTAGER_TAB, limit=SCAN_ROWS)
             except Exception as e:
                 log.debug("  Cannot read {} ({}): {}".format(mname, minfo["id"], str(e)[:80]))
                 continue
@@ -336,6 +389,9 @@ class TopolEngine:
                 self._sql_upsert(row, src)
 
                 count += 1
+            except CircuitBreakerTripped:
+                # Do not swallow — propagate up to abort the whole cycle.
+                raise
             except Exception as e:
                 log.error("  Step {} failed on row {}: {}".format(step["id"], row.get("_row"), e))
                 db.log_sync(step["id"], action, src, tgt, row.get("_row", 0), str(e)[:500], "error")
@@ -397,9 +453,18 @@ class TopolEngine:
             mn,
         ]
 
+        row_id = str(row.get("ID", "")).strip()
+
         if mn_key in MONTAGER_SHEETS:
             minfo = MONTAGER_SHEETS[mn_key]
             if minfo.get("access", False):
+                # Idempotency guard: never append a task whose ID is already in
+                # the montager's sheet. This is a second line of defence on top
+                # of the DB dedup — if PostgreSQL is unreachable, is_processed()
+                # returns False and the old code would re-append every cycle.
+                if row_id and self._montager_has_id(minfo["id"], row_id):
+                    log.info("  ⏭ {} → {}: ID {} уже есть, пропуск".format(mn, mn_key, row_id))
+                    return
                 self.client.append_row(minfo["id"], MONTAGER_TAB, row_data)
                 log.info("  ➡ {} → {} (ID {})".format(mn, mn_key, row.get("ID", "?")))
                 return
@@ -408,8 +473,28 @@ class TopolEngine:
         else:
             log.warning("  ⚠ {}: нет в MONTAGER_SHEETS, пишу в коллектор".format(mn))
 
+        if row_id and self._collector_has_id(row_id):
+            log.info("  ⏭ коллектор: ID {} уже есть, пропуск".format(row_id))
+            return
         self.client.append_row(COLLECTOR_SHEET_ID, COLLECTOR_TAB, row_data)
         log.info("  📋 {} → коллектор".format(mn))
+
+    def _montager_has_id(self, sheet_id: str, row_id: str) -> bool:
+        try:
+            tr, _ = self.client.find_row_by_field(sheet_id, MONTAGER_TAB, "ID", row_id)
+            return tr is not None
+        except Exception as e:
+            # On read failure, refuse to append rather than risk a duplicate.
+            log.warning("  Cannot verify montager sheet for ID {}: {} — skipping append".format(row_id, str(e)[:80]))
+            return True
+
+    def _collector_has_id(self, row_id: str) -> bool:
+        try:
+            tr, _ = self.client.find_row_by_field(COLLECTOR_SHEET_ID, COLLECTOR_TAB, "ID", row_id)
+            return tr is not None
+        except Exception as e:
+            log.warning("  Cannot verify collector for ID {}: {} — skipping append".format(row_id, str(e)[:80]))
+            return True
 
     def _sync_from_montager(self, row: dict, mname: str, msid: str, step: dict):
         """Синхронизирует поля из таблицы монтажёра обратно в СценарииСбор."""
@@ -462,6 +547,9 @@ class TopolEngine:
     def run_cycle(self):
         log.info("=" * 50)
         log.info("TOPOL cycle: " + datetime.now().isoformat())
+        if self.client.dry_run:
+            log.warning("DRY_RUN ON — writes are simulated only.")
+        self.client.reset_write_counter()
         self._cycle_logs = []
         total = 0
         steps_result = []
@@ -482,6 +570,13 @@ class TopolEngine:
                     "source": step["trigger"]["source_tab"],
                     "target": step.get("target", "—"), "count": count,
                 })
+            except CircuitBreakerTripped as e:
+                log.error("!! CIRCUIT BREAKER: {}".format(e))
+                log.error("!! Cycle ABORTED after {} writes. Investigate before re-running.".format(
+                    self.client.writes_this_cycle))
+                self._cycle_logs.append("CIRCUIT BREAKER tripped at step {}: {}".format(step["id"], e))
+                db.log_sync(step["id"], "circuit_breaker", "—", "—", 0, str(e)[:500], "error")
+                break
             except Exception as e:
                 log.error("Step {} ERROR: {}".format(step["id"], e))
                 steps_result.append({
